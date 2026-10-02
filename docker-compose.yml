@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: pg-perf-lab
+    environment:
+      POSTGRES_DB: perf_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - pg_perf_lab_data:/var/lib/postgresql/data
+    # Default (untuned) settings are intentional — this lab is about
+    # diagnosing problems on a realistic, out-of-the-box Postgres.
+
+volumes:
+  pg_perf_lab_data:
