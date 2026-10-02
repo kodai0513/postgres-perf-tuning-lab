@@ -8,6 +8,10 @@ TODOアプリ風のスキーマ(`users` 100,000件 / `todos` 1,000万件)を用�
 設定は意図的にDockerイメージのデフォルトのままにしています(`shared_buffers`,
 `work_mem` などをチューニング済みにしてしまうと練習になりません)。
 
+全5シナリオを収録しています。シナリオ1・2が基礎編(インデックス欠如 / メモリ設定と
+I/Oバウンドの切り分け)、シナリオ3〜5が上級編(インデックス種別の選択、`OFFSET`の
+構造的な限界、sargability/条件の書き方)です。
+
 ## セットアップ
 
 ```bash
@@ -188,6 +192,200 @@ SET work_mem = '64MB';
 
 ---
 
+## シナリオ3(上級): 「検索機能が遅い」
+
+タイトルの部分一致検索(前方一致ではなく「含む」検索)を追加したところ、遅いと報告が来ました。
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM todos WHERE title LIKE '%4242%';
+```
+
+### やってみる
+
+1. 上のクエリを実行し、なぜ`todos_pkey`や他のインデックスが使われないのか考える
+2. B-treeインデックスが`LIKE '%...%'`(前方に`%`がある=前方一致でない)を苦手とする理由を説明してみる
+3. `pg_trgm`拡張を使って解決する
+
+<details>
+<summary>解答・解説を見る</summary>
+
+#### 初期状態(実測 約393ms)
+
+```
+Parallel Seq Scan on todos
+  Filter: (title ~~ '%4242%'::text)
+  Rows Removed by Filter: 3332007
+Execution Time: 393.073 ms
+```
+
+B-treeインデックスは値を辞書順に並べた木構造なので、`前方一致`(`LIKE 'foo%'`)には
+範囲検索として使えますが、`%foo%`のように先頭が不定な条件では「どこから探せばいいか」
+がわからず活用できません。結果、他にインデックスがあってもこの条件だけは全表走査になります。
+
+#### 対処: `pg_trgm` + GINインデックス
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX idx_todos_title_trgm ON todos USING gin (title gin_trgm_ops);
+```
+
+→ 約393ms → **約20ms**(約19倍)。`pg_trgm`は文字列を3文字(トライグラム)単位に
+分解してインデックス化するため、`%`が先頭にあっても「含む」検索を高速化できます。
+
+```
+Bitmap Index Scan on idx_todos_title_trgm
+  Index Cond: (title ~~ '%4242%'::text)
+```
+
+**学び**: 「インデックスを張ったのに使われない」のは壊れているからとは限らず、
+そもそもそのインデックス種別(B-tree)がその条件(部分一致)に向いていないことがある。
+条件の形に応じてインデックス種別(B-tree / GIN / GiST / BRIN など)を選ぶ必要がある。
+
+</details>
+
+---
+
+## シナリオ4(上級): 「ページングが後半のページほど遅くなる」
+
+全ユーザー横断の最新TODO一覧に`created_at`の降順インデックスがすでにあります
+(前任者が入れてくれていた、という想定です)。
+
+```sql
+CREATE INDEX idx_todos_created_at ON todos(created_at);
+```
+
+1ページ目は速いのに、ページを進める(`OFFSET`を増やす)ほど遅くなる、という
+問い合わせを調査します。
+
+```sql
+-- 1ページ目
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, title, created_at FROM todos ORDER BY created_at DESC LIMIT 20 OFFSET 0;
+
+-- 25,000ページ目相当
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, title, created_at FROM todos ORDER BY created_at DESC LIMIT 20 OFFSET 500000;
+```
+
+### やってみる
+
+1. 両方の実行時間と`actual rows`を見比べ、何に比例して遅くなっているか特定する
+2. インデックスがちゃんと使われている(`Index Scan`である)のに、なぜ遅いのか説明してみる
+3. `OFFSET`を使わない書き方(キーセット/カーソルページネーション)に書き換える
+
+<details>
+<summary>解答・解説を見る</summary>
+
+#### OFFSET 0 (実測 約0.15ms) vs OFFSET 500000 (実測 約1349ms)
+
+```
+-- OFFSET 0
+Index Scan Backward using idx_todos_created_at on todos (actual rows=20 loops=1)
+Execution Time: 0.152 ms
+
+-- OFFSET 500000
+Index Scan Backward using idx_todos_created_at on todos (actual rows=500020 loops=1)
+Execution Time: 1349.238 ms
+```
+
+インデックスは正しく使われている(`Index Scan`)にもかかわらず、約9,000倍遅くなって
+います。理由は`OFFSET`の仕組みそのものにあります。`OFFSET N`は「N行読み飛ばす」という
+意味であり、Postgresは**先頭から数えてN+LIMIT件を実際に読んでから**、先頭のN件を
+捨てています。ページが深くなるほど読み飛ばす行数が増え、線形に遅くなります。
+インデックスを増やしても`OFFSET`自体のコストは減らせません。
+
+#### 対処: キーセット(カーソル)ページネーション
+
+「前のページの最後の行の`created_at`より古い行を20件」という条件に書き換えます。
+
+```sql
+SELECT id, title, created_at FROM todos
+WHERE created_at < '2026-07-12 07:17:14.78729'  -- 前ページ最後の行のcreated_at
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+→ ページ番号に関係なく **常に約0.1ms**。`Index Cond`で直接目的の位置から
+読み始めるため、読み飛ばしが発生しません。
+
+```
+Index Scan Backward using idx_todos_created_at on todos
+  Index Cond: (created_at < '2026-07-12 07:17:14.78729'::timestamp without time zone)
+Execution Time: 0.109 ms
+```
+
+**学び**: 「インデックスがある」=「速い」ではない。`OFFSET`は常にO(N)のコストを
+払うアクセスパターンであり、ページが深くなるSNS的なタイムラインや一覧画面では
+早い段階でキーセットページネーションに設計すべき。無限スクロールUIとも相性が良い。
+
+</details>
+
+---
+
+## シナリオ5(上級): 「インデックスがあるのにPostgresが使ってくれない」
+
+シナリオ4で`idx_todos_created_at`を作った後、バッチ処理担当から
+「『今日作成されたTODO』を数えるバッチが重い」と連絡が来ました。
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM todos WHERE created_at::date = '2026-01-15';
+```
+
+### やってみる
+
+1. `idx_todos_created_at`があるのに`Seq Scan`になっている理由を実行計画から読み取る
+2. `created_at::date`という書き方の何が問題なのか説明してみる
+3. インデックスが使える書き方に直す
+
+<details>
+<summary>解答・解説を見る</summary>
+
+#### 初期状態(実測 約333ms)
+
+```
+Parallel Seq Scan on todos
+  Filter: ((created_at)::date = '2026-01-15'::date)
+  Rows Removed by Filter: 3324211
+Execution Time: 333.489 ms
+```
+
+`idx_todos_created_at`は`created_at`という**生の列の値**に対する索引です。
+`created_at::date`は列の値をキャストして別の値を作ってから比較しているため、
+Postgresは「この行の`created_at`をキャストしたら条件に合うか」を**行ごとに
+計算しないと分からず**、インデックスを辿る方法がありません(= sargable でない)。
+これは`WHERE lower(email) = 'x'`や`WHERE created_at + interval '1 day' > now()`
+のように、**条件式の左辺(インデックス対象の列)に関数や演算を適用してしまう**
+パターン全般に共通する問題です。
+
+#### 対処: 列そのものへの範囲条件に書き換える(sargableにする)
+
+```sql
+SELECT count(*) FROM todos
+WHERE created_at >= '2026-01-15'::date
+  AND created_at <  '2026-01-15'::date + interval '1 day';
+```
+
+→ 約333ms → **約6ms**(約55倍)。列を直接比較する範囲条件になったため
+`Index Only Scan`が選ばれるようになった。
+
+```
+Index Only Scan using idx_todos_created_at on todos
+  Index Cond: ((created_at >= '2026-01-15'::date) AND (created_at < '2026-01-16 00:00:00'::timestamp...))
+  Heap Fetches: 0
+Execution Time: 6.076 ms
+```
+
+**学び**: インデックスを使わせたいなら、`WHERE`句の対象列は生のまま、
+範囲や等値で比較する形に保つ。どうしても変換が必要なら、変換後の値に対する
+**式インデックス**(`CREATE INDEX ... ON todos((created_at::date))`)という
+選択肢もあるが、まずは条件式を見直せないか検討するのが先。
+
+</details>
+
+---
+
 ## EXPLAIN の読み方 チートシート
 
 - `cost=X..Y`: プランナーの見積もりコスト(開始コスト..総コスト)。実測ではない
@@ -197,6 +395,8 @@ SET work_mem = '64MB';
 - `Buffers: shared hit=X read=Y`: `hit`はキャッシュヒット、`read`はディスクI/O。`read`が多い=I/Oバウンド
 - `Sort Method: external merge Disk:` / `HashAggregate ... Batches: >1`: `work_mem`不足によるディスクスピル
 - `Seq Scan` vs `Index Scan` vs `Bitmap Heap Scan`: テーブル規模と選択性次第でどれが最適かは変わる。`Seq Scan`が常に悪とは限らない(選択性が低いなら全表走査の方が速いこともある)
+- `Index Scan` なのに遅い: インデックスが使われていても`OFFSET`による読み飛ばしや、取得行数そのものが多ければ遅くなる。「インデックスを使っている=速い」は早合点
+- インデックスが使われない: 種別のミスマッチ(B-treeに部分一致をさせようとしている等)か、`WHERE`句の列側を関数/演算でラップしていてsargableでないケースを疑う
 
 ## 便利コマンド
 
